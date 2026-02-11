@@ -125,6 +125,39 @@ func TestUDPMessageMalformed(t *testing.T) {
 	}
 }
 
+func TestUDPMessageStream(t *testing.T) {
+	msg := &UDPMessage{
+		SessionID: 9527,
+		PacketID:  123,
+		FragID:    0,
+		FragCount: 1,
+		Addr:      "example.org:53",
+		Data:      []byte("hello"),
+	}
+
+	var stream bytes.Buffer
+	msgBuf := make([]byte, MaxUDPSize)
+	if err := WriteUDPMessage(&stream, msg, msgBuf); err != nil {
+		t.Fatalf("WriteUDPMessage() error = %v", err)
+	}
+
+	got, err := ReadUDPMessage(&stream)
+	if err != nil {
+		t.Fatalf("ReadUDPMessage() error = %v", err)
+	}
+	if !reflect.DeepEqual(got, msg) {
+		t.Fatalf("ReadUDPMessage() = %+v, want %+v", got, msg)
+	}
+}
+
+func TestReadUDPMessageMalformed(t *testing.T) {
+	// varint length = 1, payload = 0x00 (clearly not a valid UDPMessage body)
+	stream := bytes.NewBuffer([]byte{0x01, 0x00})
+	if _, err := ReadUDPMessage(stream); err == nil {
+		t.Fatal("ReadUDPMessage() should fail on malformed payload")
+	}
+}
+
 func TestReadTCPRequest(t *testing.T) {
 	tests := []struct {
 		name    string

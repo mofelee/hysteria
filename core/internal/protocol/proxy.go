@@ -13,6 +13,7 @@ import (
 
 const (
 	FrameTypeTCPRequest = 0x401
+	FrameTypeUDPMessage = 0x402
 
 	// Max length values are for preventing DoS attacks
 
@@ -220,6 +221,37 @@ func ParseUDPMessage(msg []byte) (*UDPMessage, error) {
 	m.Addr = string(bs[:lAddr])
 	m.Data = bs[lAddr:]
 	return m, nil
+}
+
+// ReadUDPMessage reads a length-prefixed UDPMessage from a stream.
+func ReadUDPMessage(r io.Reader) (*UDPMessage, error) {
+	bReader := quicvarint.NewReader(r)
+	msgLen, err := quicvarint.Read(bReader)
+	if err != nil {
+		return nil, err
+	}
+	if msgLen == 0 || msgLen > MaxUDPSize {
+		return nil, errors.ProtocolError{Message: "invalid udp message length"}
+	}
+	msgBuf := make([]byte, msgLen)
+	if _, err := io.ReadFull(r, msgBuf); err != nil {
+		return nil, err
+	}
+	return ParseUDPMessage(msgBuf)
+}
+
+// WriteUDPMessage writes a length-prefixed UDPMessage to a stream.
+func WriteUDPMessage(w io.Writer, msg *UDPMessage, msgBuf []byte) error {
+	msgN := msg.Serialize(msgBuf)
+	if msgN < 0 {
+		return errors.ProtocolError{Message: "udp message too large"}
+	}
+	frameLen := int(quicvarint.Len(uint64(msgN))) + msgN
+	frameBuf := make([]byte, frameLen)
+	n := varintPut(frameBuf, uint64(msgN))
+	copy(frameBuf[n:], msgBuf[:msgN])
+	_, err := w.Write(frameBuf)
+	return err
 }
 
 // varintPut is like quicvarint.Append, but instead of appending to a slice,

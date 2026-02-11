@@ -8,7 +8,7 @@ The keywords "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SH
 
 ## Underlying Protocol & Wire Format
 
-The Hysteria protocol MUST be implemented on top of the standard QUIC transport protocol [RFC 9000](https://datatracker.ietf.org/doc/html/rfc9000) with [Unreliable Datagram Extension](https://datatracker.ietf.org/doc/rfc9221/).
+The Hysteria protocol MUST be implemented on top of the standard QUIC transport protocol [RFC 9000](https://datatracker.ietf.org/doc/html/rfc9000).
 
 All multibyte numbers use Big Endian format.
 
@@ -90,7 +90,7 @@ If the status is OK, the server MUST then begin forwarding data between the clie
 
 ### UDP
 
-UDP packets MUST be encapsulated in the following UDPMessage format and sent over QUIC's unreliable datagram (for both client-to-server and server-to-client):
+UDP packets MUST be encapsulated in the following UDPMessage format and sent over a dedicated QUIC bidirectional stream (for both client-to-server and server-to-client). Each UDPMessage on that stream MUST be prefixed with its message length as a QUIC varint:
 
 ```
 [uint32] Session ID
@@ -102,6 +102,12 @@ UDP packets MUST be encapsulated in the following UDPMessage format and sent ove
 [bytes] Payload
 ```
 
+The client MUST open one bidirectional stream and send a stream type prefix before the first UDP message:
+
+```
+[varint] 0x402 (UDPMessage stream type)
+```
+
 The client MUST use a unique Session ID for each UDP session. The server SHOULD assign a unique UDP port to each Session ID, unless it has another mechanism to differentiate packets from different sessions (e.g., symmetric NAT, varying outbound IP addresses, etc.).
 
 The protocol does not provide an explicit way to close a UDP session. While a client can retain and reuse a Session ID indefinitely, the server SHOULD release and reassign the port associated with the Session ID after a period of inactivity or some other criteria. If the client sends a UDP packet to a Session ID that is no longer recognized by the server, the server MUST treat it as a new session and assign a new port.
@@ -110,9 +116,9 @@ If a server does not support UDP relay, it SHOULD silently discard all UDP messa
 
 #### Fragmentation
 
-Due to the limit imposed by QUIC's unreliable datagram channel, any UDP packet that exceeds QUIC's maximum datagram size MUST either be fragmented or discarded.
+If an implementation applies a transport-specific UDP message size limit, any UDP packet that exceeds that limit MUST either be fragmented or discarded.
 
-For fragmented packets, each fragment MUST carry the same unique Packet ID. The Fragment ID, starting from 0, indicates the index out of the total Fragment Count. Both the server and client MUST wait for all fragments of a fragmented packet to arrive before processing them. If one or more fragments of a packet are lost, the entire packet MUST be discarded.
+For fragmented packets, each fragment MUST carry the same unique Packet ID. The Fragment ID, starting from 0, indicates the index out of the total Fragment Count. Both the server and client MUST wait for all fragments of a fragmented packet to arrive before processing them.
 
 For packets that are not fragmented, the Fragment Count MUST be set to 1. In this case, the values of Packet ID and Fragment ID are irrelevant.
 

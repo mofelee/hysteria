@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"math/rand"
 	"net/http"
 	"sync"
@@ -11,6 +12,7 @@ import (
 	"github.com/apernet/quic-go"
 	"github.com/apernet/quic-go/http3"
 
+	coreErrs "github.com/apernet/hysteria/core/v2/errors"
 	"github.com/apernet/hysteria/core/v2/internal/congestion"
 	"github.com/apernet/hysteria/core/v2/internal/protocol"
 	"github.com/apernet/hysteria/core/v2/internal/utils"
@@ -117,8 +119,7 @@ type h3sHandler struct {
 	authMutex     sync.Mutex
 	authID        string
 	connID        uint32 // a random id for dump streams
-
-	udpSM *udpSessionManager // Only set after authentication
+	udpActive     bool
 }
 
 func newH3sHandler(config *Config, conn *quic.Conn) *h3sHandler {
@@ -182,19 +183,6 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if el := h.config.EventLogger; el != nil {
 				el.Connect(h.conn.RemoteAddr(), id, actualTx)
 			}
-			// Initialize UDP session manager (if UDP is enabled)
-			// We use sync.Once to make sure that only one goroutine is started,
-			// as ServeHTTP may be called by multiple goroutines simultaneously
-			if !h.config.DisableUDP {
-				go func() {
-					sm := newUDPSessionManager(
-						&udpIOImpl{h.conn, id, h.config.TrafficLogger, h.config.RequestHook, h.config.Outbound},
-						&udpEventLoggerImpl{h.conn, id, h.config.EventLogger},
-						h.config.UDPIdleTimeout)
-					h.udpSM = sm
-					go sm.Run()
-				}()
-			}
 		} else {
 			// Auth failed, pretend to be a normal HTTP server
 			h.masqHandler(w, r)
@@ -217,9 +205,47 @@ func (h *h3sHandler) ProxyStreamHijacker(ft http3.FrameType, id quic.ConnectionT
 	case protocol.FrameTypeTCPRequest:
 		go h.handleTCPRequest(qStream)
 		return true, nil
+	case protocol.FrameTypeUDPMessage:
+		go h.handleUDPMessageStream(qStream)
+		return true, nil
 	default:
 		return false, nil
 	}
+}
+
+func (h *h3sHandler) handleUDPMessageStream(stream *utils.QStream) {
+	defer stream.Close()
+
+	if h.config.DisableUDP {
+		return
+	}
+
+	h.authMutex.Lock()
+	if h.udpActive {
+		h.authMutex.Unlock()
+		return
+	}
+	h.udpActive = true
+	h.authMutex.Unlock()
+	defer func() {
+		h.authMutex.Lock()
+		h.udpActive = false
+		h.authMutex.Unlock()
+	}()
+
+	sm := newUDPSessionManager(
+		&udpIOImpl{
+			Conn:          h.conn,
+			Stream:        stream,
+			AuthID:        h.authID,
+			TrafficLogger: h.config.TrafficLogger,
+			RequestHook:   h.config.RequestHook,
+			Outbound:      h.config.Outbound,
+		},
+		&udpEventLoggerImpl{h.conn, h.authID, h.config.EventLogger},
+		h.config.UDPIdleTimeout,
+	)
+	_ = sm.Run()
 }
 
 func (h *h3sHandler) handleTCPRequest(stream *utils.QStream) {
@@ -323,23 +349,26 @@ func (h *h3sHandler) masqHandler(w http.ResponseWriter, r *http.Request) {
 // udpIOImpl is the IO implementation for udpSessionManager with TrafficLogger support
 type udpIOImpl struct {
 	Conn          *quic.Conn
+	Stream        *utils.QStream
 	AuthID        string
 	TrafficLogger TrafficLogger
 	RequestHook   RequestHook
 	Outbound      Outbound
+
+	writeMutex sync.Mutex
 }
 
 func (io *udpIOImpl) ReceiveMessage() (*protocol.UDPMessage, error) {
 	for {
-		msg, err := io.Conn.ReceiveDatagram(context.Background())
+		udpMsg, err := protocol.ReadUDPMessage(io.Stream)
 		if err != nil {
+			var pErr coreErrs.ProtocolError
+			if errors.As(err, &pErr) {
+				// Invalid message, this is fine - just wait for the next
+				continue
+			}
 			// Connection error, this will stop the session manager
 			return nil, err
-		}
-		udpMsg, err := protocol.ParseUDPMessage(msg)
-		if err != nil {
-			// Invalid message, this is fine - just wait for the next
-			continue
 		}
 		if io.TrafficLogger != nil {
 			ok := io.TrafficLogger.LogTraffic(io.AuthID, uint64(len(udpMsg.Data)), 0)
@@ -362,12 +391,16 @@ func (io *udpIOImpl) SendMessage(buf []byte, msg *protocol.UDPMessage) error {
 			return errDisconnect
 		}
 	}
-	msgN := msg.Serialize(buf)
-	if msgN < 0 {
+	io.writeMutex.Lock()
+	defer io.writeMutex.Unlock()
+
+	err := protocol.WriteUDPMessage(io.Stream, msg, buf)
+	var pErr coreErrs.ProtocolError
+	if errors.As(err, &pErr) {
 		// Message larger than buffer, silent drop
 		return nil
 	}
-	return io.Conn.SendDatagram(buf[:msgN])
+	return err
 }
 
 func (io *udpIOImpl) Hook(data []byte, reqAddr *string) error {

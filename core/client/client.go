@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	coreErrs "github.com/apernet/hysteria/core/v2/errors"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/apernet/quic-go"
 	"github.com/apernet/quic-go/http3"
+	"github.com/apernet/quic-go/quicvarint"
 )
 
 const (
@@ -155,7 +157,13 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 	c.pktConn = pktConn
 	c.conn = conn
 	if authResp.UDPEnabled {
-		c.udpSM = newUDPSessionManager(&udpIOImpl{Conn: conn})
+		udpIO, err := newUDPIOImpl(conn)
+		if err != nil {
+			_ = conn.CloseWithError(closeErrCodeProtocolError, "")
+			_ = pktConn.Close()
+			return nil, coreErrs.ConnectError{Err: err}
+		}
+		c.udpSM = newUDPSessionManager(udpIO)
 	}
 	return &HandshakeInfo{
 		UDPEnabled: authResp.UDPEnabled,
@@ -293,30 +301,49 @@ func (c *tcpConn) SetWriteDeadline(t time.Time) error {
 }
 
 type udpIOImpl struct {
-	Conn *quic.Conn
+	Stream *utils.QStream
+
+	writeMutex sync.Mutex
+}
+
+func newUDPIOImpl(conn *quic.Conn) (*udpIOImpl, error) {
+	stream, err := conn.OpenStream()
+	if err != nil {
+		return nil, err
+	}
+	qStream := &utils.QStream{Stream: stream}
+	ftBuf := quicvarint.Append(nil, protocol.FrameTypeUDPMessage)
+	if _, err := qStream.Write(ftBuf); err != nil {
+		_ = qStream.Close()
+		return nil, err
+	}
+	return &udpIOImpl{Stream: qStream}, nil
 }
 
 func (io *udpIOImpl) ReceiveMessage() (*protocol.UDPMessage, error) {
 	for {
-		msg, err := io.Conn.ReceiveDatagram(context.Background())
+		udpMsg, err := protocol.ReadUDPMessage(io.Stream)
 		if err != nil {
+			var pErr coreErrs.ProtocolError
+			if errors.As(err, &pErr) {
+				// Invalid message, this is fine - just wait for the next
+				continue
+			}
 			// Connection error, this will stop the session manager
 			return nil, err
-		}
-		udpMsg, err := protocol.ParseUDPMessage(msg)
-		if err != nil {
-			// Invalid message, this is fine - just wait for the next
-			continue
 		}
 		return udpMsg, nil
 	}
 }
 
 func (io *udpIOImpl) SendMessage(buf []byte, msg *protocol.UDPMessage) error {
-	msgN := msg.Serialize(buf)
-	if msgN < 0 {
+	io.writeMutex.Lock()
+	defer io.writeMutex.Unlock()
+	err := protocol.WriteUDPMessage(io.Stream, msg, buf)
+	var pErr coreErrs.ProtocolError
+	if errors.As(err, &pErr) {
 		// Message larger than buffer, silent drop
 		return nil
 	}
-	return io.Conn.SendDatagram(buf[:msgN])
+	return err
 }
