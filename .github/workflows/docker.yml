@@ -5,6 +5,10 @@ on:
     tags:
       - app/v*.*.*
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   docker:
     runs-on: ubuntu-latest
@@ -25,11 +29,16 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to DockerHub
+      - name: Set image name
+        id: image_name
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/hysteria" >> $GITHUB_OUTPUT
+
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
         id: docker_build
@@ -38,7 +47,10 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: tobyxdd/hysteria:latest,tobyxdd/hysteria:v2,tobyxdd/hysteria:${{ steps.get_version.outputs.version }}
+          tags: |
+            ${{ steps.image_name.outputs.name }}:latest
+            ${{ steps.image_name.outputs.name }}:v2
+            ${{ steps.image_name.outputs.name }}:${{ steps.get_version.outputs.version }}
 
       - name: Image digest
         run: echo ${{ steps.docker_build.outputs.digest }}
